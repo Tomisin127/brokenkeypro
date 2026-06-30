@@ -13,6 +13,8 @@ class LlamaEngine {
     static serverExe := ""
     static modelPath := ""
     static lastPrompt := ""
+    static lastResponse := ""
+    static timeoutMs := 15000
 
     static Init(modelPath := "", llamaDir := "", nCtx := 512, nThreads := 0) {
         this.Shutdown()
@@ -58,7 +60,20 @@ class LlamaEngine {
 
         this.Loaded := true
         this.LoadError := ""
+        this.Warmup()
         return true
+    }
+
+    ; First completion can take 20–30s on CPU; warmup keeps later calls under ~1s.
+    static Warmup() {
+        if !this.Loaded
+            return false
+        try {
+            this.Complete("Answer with one letter: d", 2, 60000)
+            return true
+        } catch {
+            return false
+        }
     }
 
     static ResolveServerExe(llamaDir) {
@@ -85,19 +100,22 @@ class LlamaEngine {
         return A_ScriptDir "\smolm-135m.gguf"
     }
 
-    static Complete(prompt, maxTokens := 1) {
+    static Complete(prompt, maxTokens := 4, timeoutMs := 0) {
         if !this.Loaded
             return ""
 
+        if (timeoutMs <= 0)
+            timeoutMs := this.timeoutMs
+
         body := '{"prompt":"' this._JsonEscape(prompt)
             . '","n_predict":' maxTokens
-            . ',"temperature":0.05,"top_k":10,"top_p":0.85'
-            . ',"cache_prompt":true,"stop":["\n"," ","\t","."]}'
+            . ',"temperature":0.1,"top_k":20,"top_p":0.9'
+            . ',"cache_prompt":true,"stop":["\n"]}'
 
         try {
-            resp := this._Post("/completion", body, 2500)
+            resp := this._Post("/completion", body, timeoutMs)
         } catch as e {
-            this.LoadError := e.Message
+            this.lastResponse := ""
             return ""
         }
 
@@ -105,9 +123,8 @@ class LlamaEngine {
         if (text = "" && InStr(resp, '"content"'))
             text := this._JsonField(resp, "content")
 
-        text := Trim(text, "`r`n `t")
-        text := RegExReplace(text, "`n.*", "")
         this.lastPrompt := prompt
+        this.lastResponse := text
         return text
     }
 
@@ -191,9 +208,9 @@ class LlamaEngine {
 
     static StatusText() {
         if this.Loaded
-            return "llama-server on port " this.port
+            return "ready (port " this.port ")"
         if (this.LoadError != "")
             return this.LoadError
-        return "not running"
+        return "not running — run Setup-AI.ps1"
     }
 }

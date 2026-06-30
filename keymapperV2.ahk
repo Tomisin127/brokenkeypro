@@ -30,7 +30,9 @@ global BIGRAM_PATH    := ""
 global AI_MODEL       := ""
 global AI_ENABLED     := true
 global AI_MIN_CONFIDENCE := 40
-global AI_MAX_TOKENS  := 1
+global AI_SCORE_THRESHOLD := 2.0
+global REJECTION_AI_WINDOW_MS := 20000
+global AI_MAX_TOKENS  := 8
 global AI_CTX         := 512
 global AI_THREADS     := 0
 global AI_PORT        := 8765
@@ -47,6 +49,7 @@ global traverseStack  := Map()
 global charBuffer     := ""
 global maxBuffer      := 2000
 global lastPrediction := { host: "", char: "", alts: [], pos: 0, ts: 0, prefix: "" }
+global lastRejectedPrediction := { char: "", prefix: "", host: "", ts: 0 }
 
 global sendingInternally := false
 global learnedPending := Map()
@@ -176,36 +179,100 @@ InitAI() {
     if !ok
         LogMsg("AI init failed: " LlamaEngine.LoadError)
     else
-        LogMsg("AI ready: llama-server port " AI_PORT)
+        LogMsg("AI ready: " LlamaEngine.StatusText() " (warmup done)")
     return ok
 }
 
-BuildAIPrompt(ctx) {
+UpdateAIStatus() {
+    global AI_ENABLED, GuiObj
+    if !IsObject(GuiObj)
+        return
+    try {
+        if !AI_ENABLED {
+            GuiObj["AIText"].Text := "  AI: disabled"
+            GuiObj["AIText"].Opt("cAAAAAA")
+        } else if LlamaEngine.Loaded {
+            GuiObj["AIText"].Text := "  AI: " LlamaEngine.StatusText()
+            GuiObj["AIText"].Opt("c90EE90")
+        } else {
+            GuiObj["AIText"].Text := "  AI: " LlamaEngine.StatusText()
+            GuiObj["AIText"].Opt("cFFB347")
+        }
+    }
+}
+
+BuildAIPrompt(ctx, allowedLetters, rejectedChar := "") {
     recent := ctx.recentText
     if (StrLen(recent) > 300)
         recent := SubStr(recent, -300)
-    prompt := "Reply with exactly ONE letter character.`n"
-        . "Full session text: " recent "`n"
+    opts := ArrayJoin(allowedLetters, ", ")
+    prompt := "You complete English words one letter at a time.`n"
+        . "Session: " recent "`n"
     if (ctx.prevWord != "")
-        prompt .= "Word before cursor: " ctx.prevWord "`n"
+        prompt .= "Previous word: " ctx.prevWord "`n"
     if (ctx.prefix != "")
-        prompt .= "Current incomplete word: " ctx.prefix "`n"
+        prompt .= "Partial word: " ctx.prefix "`n"
     else if (ctx.prevWord != "")
-        prompt .= "Next letter starts a new word after: " ctx.prevWord "`n"
-    prompt .= "Next letter only:"
+        prompt .= "New word after: " ctx.prevWord "`n"
+    prompt .= "Choose exactly ONE letter from: " opts "`n"
+    if (rejectedChar != "")
+        prompt .= "Do NOT pick '" rejectedChar "' (user rejected it).`n"
+    prompt .= "Answer:"
     return prompt
 }
 
-ExtractSingleLetter(aiText, prefix) {
-    aiText := Trim(aiText, "`r`n `t.:;,")
-    if (prefix != "" && StrLen(aiText) > StrLen(prefix)) {
-        tail := SubStr(aiText, StrLen(prefix) + 1)
-        if RegExMatch(tail, "[a-zA-Z]")
-            return SubStr(tail, 1, 1)
+ExtractLetterFromAI(aiText, prefix, allowedLetters, rejectedChar := "") {
+    aiText := StrLower(Trim(aiText, "`r`n `t.:;,!"))
+    if (aiText = "")
+        return ""
+
+    if RegExMatch(aiText, "^[a-z]$") {
+        for , letter in allowedLetters {
+            if (StrLower(letter) = aiText && StrLower(letter) != StrLower(rejectedChar))
+                return letter
+        }
     }
-    if RegExMatch(aiText, "[a-zA-Z]")
-        return SubStr(aiText, 1, 1)
+
+    best := "", bestScore := -999.0
+    for , letter in allowedLetters {
+        ch := StrLower(letter)
+        if (rejectedChar != "" && ch = StrLower(rejectedChar))
+            continue
+        if InStr(aiText, ch) {
+            ds := GetDictionaryLetterScore(prefix, letter)
+            if (ds > bestScore) {
+                bestScore := ds
+                best := letter
+            }
+        }
+    }
+    if (best != "")
+        return best
+
+    if (prefix != "" && StrLen(aiText) >= StrLen(prefix) && SubStr(aiText, 1, StrLen(prefix)) = StrLower(prefix)) {
+        tail := SubStr(aiText, StrLen(prefix) + 1)
+        if RegExMatch(tail, "[a-z]", &m) {
+            for , letter in allowedLetters {
+                if (StrLower(letter) = m[0] && StrLower(letter) != StrLower(rejectedChar))
+                    return letter
+            }
+        }
+    }
     return ""
+}
+
+PickBestDictLetter(prefix, allowedLetters, excludeChar := "") {
+    best := "", bestScore := -999.0
+    for , letter in allowedLetters {
+        if (excludeChar != "" && StrLower(letter) = StrLower(excludeChar))
+            continue
+        ds := GetDictionaryLetterScore(prefix, letter)
+        if (ds > bestScore) {
+            bestScore := ds
+            best := letter
+        }
+    }
+    return bestScore >= 0 ? best : ""
 }
 
 CallAI(prompt) {
@@ -214,8 +281,12 @@ CallAI(prompt) {
         return ""
 
     result := LlamaEngine.Complete(prompt, AI_MAX_TOKENS)
-    if (result != "")
+    snippet := StrReplace(SubStr(result, 1, 40), "`n", " ")
+    if (result != "") {
         stats["ai_calls"] += 1
+        LogMsg("AI ok: [" snippet "]")
+    } else
+        LogMsg("AI empty/timeout for: " SubStr(prompt, 1, 80))
     return result
 }
 
@@ -264,9 +335,11 @@ GetLettersAfterPreviousWord(prevWord, allowedLetters) {
 }
 
 GetLearnedLetterScores(prefix, allowedLetters) {
-    global userLearned
+    global userLearned, wordTrie
     scores := Map()
     for word, freq in userLearned {
+        if !wordTrie.IsCompleteWord(word)
+            continue
         if (prefix != "" && SubStr(word, 1, StrLen(prefix)) != prefix)
             continue
         ch := SubStr(word, StrLen(prefix) + 1, 1)
@@ -290,8 +363,113 @@ GetDoubleLetterBoost(prefix, letter) {
     return node ? 0.85 : 0.0
 }
 
-PredictNextLetters(ctx, allowedLetters, skipAI := false) {
-    global wordTrie, bigrams, AI_ENABLED, AI_MIN_CONFIDENCE
+; Fast trie lookup — invalid English continuations get a heavy penalty.
+GetDictionaryLetterScore(prefix, letter) {
+    global wordTrie, totalUniFreq
+    cand := StrLower(prefix) . StrLower(letter)
+    node := wordTrie.GetNode(cand)
+    if !node
+        return -10.0
+
+    score := 0.0
+    if node["end"]
+        score += 1.5 + Min(0.5, node["freq"] / 50000.0)
+
+    if totalUniFreq > 0 {
+        subtree := wordTrie.GetSubtreeFreq(cand)
+        score += Min(2.5, (subtree / totalUniFreq) * 60.0)
+    }
+    return score
+}
+
+BestDictionaryScore(prefix, allowedLetters) {
+    best := -999.0
+    for , letter in allowedLetters
+        best := Max(best, GetDictionaryLetterScore(prefix, letter))
+    return best
+}
+
+HasRecentRejectedPrediction(host, prefix) {
+    global lastRejectedPrediction, REJECTION_AI_WINDOW_MS
+    if (lastRejectedPrediction.char = "" || lastRejectedPrediction.host != host)
+        return false
+    if (A_TickCount - lastRejectedPrediction.ts > REJECTION_AI_WINDOW_MS)
+        return false
+    return (lastRejectedPrediction.prefix = prefix)
+}
+
+ClearRejectedPrediction() {
+    global lastRejectedPrediction
+    lastRejectedPrediction := { char: "", prefix: "", host: "", ts: 0 }
+}
+
+ShouldInvokeAI(ctx, allowedLetters, scores, bestScore, skipAI, host := "") {
+    global AI_ENABLED, AI_SCORE_THRESHOLD
+    if (skipAI || !AI_ENABLED || !LlamaEngine.Loaded)
+        return { use: false, rejected: "" }
+
+    rejected := ""
+    if (host != "" && HasRecentRejectedPrediction(host, ctx.prefix)) {
+        rejected := lastRejectedPrediction.char
+        return { use: true, rejected: rejected }
+    }
+
+    bestDict := BestDictionaryScore(ctx.prefix, allowedLetters)
+    if (bestDict < 0)
+        return { use: true, rejected: "" }
+
+    if (scores.Count = 0 || bestScore < AI_SCORE_THRESHOLD)
+        return { use: true, rejected: "" }
+
+    topLetter := "", topScore := -999.0
+    for letter, s in scores {
+        if (s > topScore) {
+            topScore := s
+            topLetter := letter
+        }
+    }
+    if (topLetter != "" && GetDictionaryLetterScore(ctx.prefix, topLetter) < 0)
+        return { use: true, rejected: "" }
+
+    if (StrLen(ctx.prefix) >= 3 && bestScore < AI_SCORE_THRESHOLD * 1.5)
+        return { use: true, rejected: "" }
+
+    return { use: false, rejected: "" }
+}
+
+ApplyAISuggestion(scores, &source, ctx, allowedLetters, rejectedChar := "") {
+    aiText := CallAI(BuildAIPrompt(ctx, allowedLetters, rejectedChar))
+    aiLetter := ExtractLetterFromAI(aiText, ctx.prefix, allowedLetters, rejectedChar)
+
+    if (aiLetter = "" && rejectedChar != "")
+        aiLetter := PickBestDictLetter(ctx.prefix, allowedLetters, rejectedChar)
+
+    if (aiLetter = "")
+        return false
+
+    for , letter in allowedLetters {
+        if (StrLower(letter) = StrLower(aiLetter)) {
+            boost := rejectedChar != "" ? 3.0 : 2.0
+            scores[letter] := scores.Get(letter, 0) + boost
+            source := "ai"
+            return true
+        }
+    }
+    return false
+}
+
+PickBestValidCandidate(ranked, prefix) {
+    if (ranked.Length = 0)
+        return ""
+    for , item in ranked {
+        if (GetDictionaryLetterScore(prefix, item.ch) >= 0)
+            return item.ch
+    }
+    return ranked[1].ch
+}
+
+PredictNextLetters(ctx, allowedLetters, skipAI := false, host := "") {
+    global wordTrie, bigrams, AI_ENABLED
     prefix := ctx.prefix
     prev := ctx.prevWord
     scores := Map()
@@ -350,18 +528,10 @@ PredictNextLetters(ctx, allowedLetters, skipAI := false) {
     for , s in scores
         bestScore := Max(bestScore, s)
 
-    if (!skipAI && AI_ENABLED && (scores.Count = 0 || bestScore < 0.35)) {
-        aiText := CallAI(BuildAIPrompt(ctx))
-        aiLetter := ExtractSingleLetter(aiText, prefix)
-        if (aiLetter != "") {
-            for , letter in allowedLetters {
-                if (StrLower(letter) = StrLower(aiLetter)) {
-                    scores[letter] := scores.Get(letter, 0) + 1.5
-                    source := "ai"
-                    break
-                }
-            }
-        }
+    aiPlan := ShouldInvokeAI(ctx, allowedLetters, scores, bestScore, skipAI, host)
+    if (aiPlan.use) {
+        if ApplyAISuggestion(scores, &source, ctx, allowedLetters, aiPlan.rejected)
+            ClearRejectedPrediction()
     }
 
     if (scores.Count = 0) {
@@ -373,16 +543,17 @@ PredictNextLetters(ctx, allowedLetters, skipAI := false) {
     return { scores: scores, source: source }
 }
 
-RankCandidates(ctx, outs, skipAI := false) {
+RankCandidates(ctx, outs, skipAI := false, host := "") {
     prefix := ctx.prefix
     prev := ctx.prevWord
-    pred := PredictNextLetters(ctx, outs, skipAI)
+    pred := PredictNextLetters(ctx, outs, skipAI, host)
     ranked := []
     for , letter in outs {
         score := pred.scores.Get(letter, 0)
         score += ScoreCandidate(prefix, letter, prev)
         score += GetDoubleLetterBoost(prefix, letter)
-        ranked.Push({ ch: letter, score: score })
+        score += GetDictionaryLetterScore(prefix, letter) * 3.0
+        ranked.Push({ ch: letter, score: score, dict: GetDictionaryLetterScore(prefix, letter) })
     }
     n := ranked.Length
     Loop n - 1 {
@@ -405,6 +576,7 @@ SourceLabel(src) {
         case "trie": return "trie"
         case "bigram": return "bigram"
         case "ai": return "AI"
+        case "dict": return "dict"
         default: return "fallback"
     }
 }
@@ -485,6 +657,7 @@ Main() {
     BuildMainGui()
     BuildHud()
     BuildTrayMenu()
+    UpdateAIStatus()
 
     Hotkey("F12", ToggleMode)
     Hotkey("^F12", (*) => AddOrEditMapping())
@@ -534,6 +707,11 @@ class Trie {
             node := node["children"][ch]
         }
         return node
+    }
+
+    IsCompleteWord(word) {
+        node := this.GetNode(word)
+        return node && node["end"]
     }
 
     GetSubtreeFreq(prefix) {
@@ -859,6 +1037,8 @@ BuildMainGui() {
     btn.OnEvent("Click", ShowStats)
 
     GuiObj.SetFont("s8 c1E3A8A", "Segoe UI")
+    GuiObj.AddText("x20 y448 w540 h18 BackgroundTrans vAIText c90EE90", "  AI: …")
+
     GuiObj.AddText("x20 y468 w540 h40 BackgroundTrans vTxtHotkeys", T("hotkeys"))
 
     GuiObj.OnEvent("Close",  (*) => OnExitApp())
@@ -981,6 +1161,8 @@ LearnIfWordCompleted() {
     word := GetCurrentPrefix()
     if (word = "" || StrLen(word) < 2 || !RegExMatch(word, "^[a-z']+$") || StrLen(word) > 30)
         return
+    if !wordTrie.IsCompleteWord(word)
+        return
     wordTrie.Insert(word, 50)
     learnedPending[word] := learnedPending.Get(word, 0) + 1
     userLearned[word] := userLearned.Get(word, 0) + 1
@@ -1087,12 +1269,23 @@ TruncateLearnedIfHuge() {
 ~Enter::SafeWordBoundary(" ")
 
 ~Backspace:: {
-    global charBuffer, sendingInternally
+    global charBuffer, sendingInternally, lastPrediction, lastRejectedPrediction
     if sendingInternally
         return
     CommitTraversal()
-    if StrLen(charBuffer) > 0
+    if StrLen(charBuffer) > 0 {
+        removed := SubStr(charBuffer, -1)
         charBuffer := SubStr(charBuffer, 1, -1)
+        if (lastPrediction.char != "" && StrLower(removed) = StrLower(lastPrediction.char)) {
+            lastRejectedPrediction := {
+                char: lastPrediction.char,
+                prefix: lastPrediction.prefix,
+                host: lastPrediction.host,
+                ts: A_TickCount
+            }
+            LogMsg("Rejected prediction: " lastPrediction.char " at prefix '" lastPrediction.prefix "'")
+        }
+    }
 }
 
 SafeBufferChar(ch) {
@@ -1214,7 +1407,7 @@ SendPredictedOrLocked(host, *) {
 
         CommitTraversal()
         ctx := GetTypingContext()
-        result := RankCandidates(ctx, outs, false)
+        result := RankCandidates(ctx, outs, false, host)
         ranked := result.ranked
         srcTag := SourceLabel(result.source)
 
@@ -1223,6 +1416,13 @@ SendPredictedOrLocked(host, *) {
             srcTag := "fallback"
         } else {
             best := ranked[1].ch
+            if (GetDictionaryLetterScore(ctx.prefix, best) < 0) {
+                validBest := PickBestValidCandidate(ranked, ctx.prefix)
+                if (validBest != "" && validBest != best) {
+                    best := validBest
+                    srcTag := result.source = "ai" ? "AI" : "dict"
+                }
+            }
         }
 
         out := best
@@ -1502,11 +1702,15 @@ ImportConfig(*) {
 }
 
 ShowStats(*) {
-    global stats
+    global stats, AI_ENABLED
     elapsedMin := Round((A_TickCount - stats["session_start"]) / 60000, 1)
+    aiLine := AI_ENABLED
+        ? (LlamaEngine.Loaded ? LlamaEngine.StatusText() : LlamaEngine.LoadError)
+        : "disabled"
     msg :=  T("stats_title") "`n`n"
         . T("stats_predictions") ": " stats["predictions"] "`n"
         . T("stats_ai") ":          " stats["ai_calls"] "`n"
+        . "AI status:    " aiLine "`n"
         . T("stats_session") ":      " elapsedMin " min"
     SaveStats()
     MsgBox msg, T("btn_stats"), "Iconi"
