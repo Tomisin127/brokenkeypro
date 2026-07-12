@@ -21,6 +21,10 @@ class McpClient {
         try {
             req := ComObject("WinHttp.WinHttpRequest.5.1")
             req.Open("GET", this.baseUrl "/health", false)
+            ; Force a direct (no-proxy) connection. On PCs with a system/WinHTTP
+            ; proxy configured, localhost can otherwise be routed through the
+            ; proxy and fail with 0x80072EFD (ERROR_WINHTTP_CANNOT_CONNECT).
+            try req.SetProxy(1)
             req.SetTimeouts(3000, 3000, 3000, 3000)
             req.Send()
             if (req.Status != 200) {
@@ -43,6 +47,8 @@ class McpClient {
         try {
             req := ComObject("WinHttp.WinHttpRequest.5.1")
             req.Open("POST", this.baseUrl "/read", false)
+            ; Force a direct (no-proxy) connection for localhost - see Ping().
+            try req.SetProxy(1)
             req.SetTimeouts(this.timeoutMs, this.timeoutMs, this.timeoutMs, this.timeoutMs)
             req.SetRequestHeader("Content-Type", "application/json")
             req.Send(body)

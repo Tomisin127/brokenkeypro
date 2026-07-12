@@ -8,8 +8,18 @@ param(
 $ErrorActionPreference = "Stop"
 $RootDir = (Resolve-Path $RootDir).Path
 
+# Path to a diagnostics log so npx / network failures are visible on other PCs.
+$script:StderrLog = Join-Path $RootDir "mcp-stderr.log"
+try { Set-Content -LiteralPath $script:StderrLog -Value "" -Encoding UTF8 } catch {}
+
+# Tracks whether the MCP server initialized. When false, the bridge still
+# serves HTTP and answers /read by reading files directly from disk.
+$script:McpReady = $false
+
 function Write-Log([string]$Msg) {
-    Write-Host ((Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " | MCP bridge | " + $Msg)
+    $line = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " | MCP bridge | " + $Msg
+    Write-Host $line
+    try { Add-Content -LiteralPath $script:StderrLog -Value $line -Encoding UTF8 } catch {}
 }
 
 function Resolve-NpxPath {
@@ -74,8 +84,12 @@ function Start-McpProcess([hashtable]$Launcher) {
     $psi.WorkingDirectory = $RootDir
 
     $proc = [System.Diagnostics.Process]::Start($psi)
-    Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
-        if ($EventArgs.Data) { Write-Verbose $EventArgs.Data }
+    # Capture the MCP server's stderr to mcp-stderr.log so npm/network errors
+    # (e.g. first-run download failures behind a proxy/firewall) are visible.
+    Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $script:StderrLog -Action {
+        if ($EventArgs.Data) {
+            try { Add-Content -LiteralPath $Event.MessageData -Value $EventArgs.Data -Encoding UTF8 } catch {}
+        }
     } | Out-Null
     $proc.BeginErrorReadLine()
     Start-Sleep -Milliseconds 1200
@@ -137,7 +151,9 @@ function Initialize-Mcp([System.Diagnostics.Process]$Proc) {
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"BrokenKeyRemapper","version":"2.1.0"}}}
 '@.Trim()
     Send-McpLine $Proc $initJson
-    $init = Wait-McpResponse $Proc 1 25000
+    # Allow a generous window: on a fresh PC, npx must download the
+    # @modelcontextprotocol/server-filesystem package before the server responds.
+    $init = Wait-McpResponse $Proc 1 90000
     if ($init.error) { throw "MCP initialize failed: $($init.error.message)" }
     Send-McpLine $Proc '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     Start-Sleep -Milliseconds 400
@@ -203,8 +219,28 @@ Write-Log "Launcher: $($launcher.Detail)"
 Write-Log "NPX: $($launcher.File)"
 Write-Log "HTTP: http://127.0.0.1:$Port/health"
 
-$mcpProc = Start-McpProcess $launcher
-Initialize-Mcp $mcpProc
+# Start the MCP server and try to initialize it. If this fails (e.g. the
+# @modelcontextprotocol/server-filesystem package can't be downloaded on a
+# fresh PC that is offline or behind a proxy/firewall), we DO NOT abort.
+# Instead we keep running and serve /read straight from disk. This guarantees
+# the HTTP listener always comes up so the AutoHotkey client never sees
+# ERROR_WINHTTP_CANNOT_CONNECT (0x80072EFD).
+$mcpProc = $null
+try {
+    $mcpProc = Start-McpProcess $launcher
+    if ($mcpProc.HasExited) {
+        throw "MCP server process exited immediately (exit code $($mcpProc.ExitCode)). See mcp-stderr.log."
+    }
+    Initialize-Mcp $mcpProc
+    $script:McpReady = $true
+    Write-Log "MCP server initialized - using MCP tools for reads."
+} catch {
+    $script:McpReady = $false
+    Write-Log "WARNING: MCP init failed - falling back to direct disk reads. Reason: $($_.Exception.Message)"
+    Write-Log "This is usually caused by npx being unable to download @modelcontextprotocol/server-filesystem (offline / proxy / firewall)."
+    try { if ($mcpProc -and !$mcpProc.HasExited) { $mcpProc.Kill() } } catch {}
+    $mcpProc = $null
+}
 $requestId = 10
 
 $listener = New-Object System.Net.HttpListener
@@ -222,7 +258,8 @@ try {
 
         try {
             if ($path -eq "/health") {
-                Send-HttpJson $res 200 ('{"ok":true,"root":"' + (Escape-JsonString $RootDir) + '"}')
+                $mode = if ($script:McpReady) { "mcp" } else { "direct" }
+                Send-HttpJson $res 200 ('{"ok":true,"mode":"' + $mode + '","root":"' + (Escape-JsonString $RootDir) + '"}')
                 continue
             }
 
@@ -233,7 +270,17 @@ try {
                 $payload = $body | ConvertFrom-Json
                 $rel = [string]$payload.path
                 if ([string]::IsNullOrWhiteSpace($rel)) { $rel = "learned_words.txt" }
-                $text = Invoke-McpReadTextFile $mcpProc $rel ([ref]$requestId)
+
+                if ($script:McpReady -and $mcpProc -and !$mcpProc.HasExited) {
+                    $text = Invoke-McpReadTextFile $mcpProc $rel ([ref]$requestId)
+                } else {
+                    # MCP is not available - read directly from disk.
+                    $safe = $rel.Trim().Replace("\", "/")
+                    if ($safe -match '\.\.') { throw "Path traversal not allowed" }
+                    $full = Join-Path $RootDir ($safe -replace '/', [IO.Path]::DirectorySeparatorChar)
+                    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "File not found: $rel" }
+                    $text = [IO.File]::ReadAllText($full, [Text.Encoding]::UTF8)
+                }
                 Send-HttpJson $res 200 ('{"ok":true,"path":"' + (Escape-JsonString $rel) + '","content":"' + (Escape-JsonString $text) + '"}')
                 continue
             }
@@ -246,6 +293,8 @@ try {
 } finally {
     Write-Log "Shutting down..."
     try { $listener.Stop() } catch {}
-    try { $mcpProc.StandardInput.Close() } catch {}
-    try { if (!$mcpProc.HasExited) { $mcpProc.Kill() } } catch {}
+    if ($mcpProc) {
+        try { $mcpProc.StandardInput.Close() } catch {}
+        try { if (!$mcpProc.HasExited) { $mcpProc.Kill() } } catch {}
+    }
 }
