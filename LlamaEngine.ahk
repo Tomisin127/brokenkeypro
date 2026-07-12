@@ -15,6 +15,7 @@ class LlamaEngine {
     static lastPrompt := ""
     static lastResponse := ""
     static timeoutMs := 15000
+    static mcpToolsEnabled := false
 
     static Init(modelPath := "", llamaDir := "", nCtx := 512, nThreads := 0) {
         this.Shutdown()
@@ -100,6 +101,10 @@ class LlamaEngine {
         return A_ScriptDir "\smolm-135m.gguf"
     }
 
+    static GetMcpToolDefinitionsJson() {
+        return '[{"type":"function","function":{"name":"read_file","description":"Read a text file from the MCP filesystem server (app directory). Use this to load learned_words.txt for personal vocabulary.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative path, e.g. learned_words.txt"}},"required":["path"]}}}]'
+    }
+
     static Complete(prompt, maxTokens := 4, timeoutMs := 0) {
         if !this.Loaded
             return ""
@@ -114,7 +119,7 @@ class LlamaEngine {
 
         try {
             resp := this._Post("/completion", body, timeoutMs)
-        } catch as e {
+        } catch {
             this.lastResponse := ""
             return ""
         }
@@ -126,6 +131,91 @@ class LlamaEngine {
         this.lastPrompt := prompt
         this.lastResponse := text
         return text
+    }
+
+    ; MCP-aware completion: sends tool definitions, executes read_file via callback, then final answer.
+    static CompleteWithMcpTools(prompt, mcpReadFn, maxTokens := 8, timeoutMs := 0) {
+        if !this.Loaded
+            return ""
+
+        if (timeoutMs <= 0)
+            timeoutMs := this.timeoutMs
+
+        toolsJson := this.GetMcpToolDefinitionsJson()
+        sysMsg := "You complete text one letter at a time. When personal vocabulary is needed, call read_file on learned_words.txt via MCP before answering."
+        userMsg := prompt
+
+        messagesJson := '[{"role":"system","content":"' this._JsonEscape(sysMsg) '"}'
+            . ',{"role":"user","content":"' this._JsonEscape(userMsg) '"}]'
+
+        try {
+            chatBody := '{"messages":' messagesJson
+                . ',"tools":' toolsJson
+                . ',"tool_choice":"auto"'
+                . ',"temperature":0.1,"top_k":20,"top_p":0.9'
+                . ',"max_tokens":' maxTokens '}'
+            resp := this._Post("/v1/chat/completions", chatBody, timeoutMs)
+            toolCalls := this._ExtractToolCalls(resp)
+
+            if (toolCalls.Length > 0) {
+                toolResults := ""
+                for , tc in toolCalls {
+                    path := tc.Has("path") ? tc["path"] : "learned_words.txt"
+                    content := mcpReadFn.Call(path)
+                    if (content = "")
+                        content := "(MCP read_file returned empty — file may be missing)"
+                    toolResults .= "read_file(" path "):`n" content "`n"
+                }
+                followUp := prompt "`n`n[MCP tool results]`n" toolResults "`nAnswer with one letter only:"
+                return this.Complete(followUp, maxTokens, timeoutMs)
+            }
+
+            text := this._ExtractChatContent(resp)
+            if (text != "") {
+                this.lastPrompt := prompt
+                this.lastResponse := text
+                return text
+            }
+        } catch {
+            ; /v1/chat/completions or tool calling not supported — fall through
+        }
+
+        ; Proactive MCP read + enriched legacy completion
+        mcpContent := mcpReadFn.Call("learned_words.txt")
+        enriched := prompt
+        if (mcpContent != "")
+            enriched .= "`n`n[MCP read_file(learned_words.txt)]`n" mcpContent "`n"
+        return this.Complete(enriched, maxTokens, timeoutMs)
+    }
+
+    static _ExtractToolCalls(json) {
+        calls := []
+        pos := 1
+        while RegExMatch(json, '"tool_calls"\s*:\s*\[', &m, pos) {
+            blockStart := m.Pos + StrLen(m[0]) - 1
+            block := SubStr(json, blockStart)
+            if RegExMatch(block, '\{"id"[^}]*"function"\s*:\s*\{"name"\s*:\s*"read_file"[^}]*"arguments"\s*:\s*"((?:\\.|[^"\\])*)"', &tc) {
+                argsRaw := this._JsonUnescape(tc[1])
+                path := "learned_words.txt"
+                if RegExMatch(argsRaw, '"path"\s*:\s*"([^"]+)"', &pm)
+                    path := pm[1]
+                calls.Push(Map("path", path))
+            } else if RegExMatch(block, '"arguments"\s*:\s*\{[^}]*"path"\s*:\s*"([^"]+)"', &pm2) {
+                calls.Push(Map("path", pm2[1]))
+            }
+            pos := blockStart + 1
+            if (calls.Length > 0)
+                break
+        }
+        return calls
+    }
+
+    static _ExtractChatContent(json) {
+        if RegExMatch(json, '"message"\s*:\s*\{[^}]*"content"\s*:\s*"((?:\\.|[^"\\])*)"', &m)
+            return this._JsonUnescape(m[1])
+        if RegExMatch(json, '"content"\s*:\s*"((?:\\.|[^"\\])*)"', &m2)
+            return this._JsonUnescape(m2[1])
+        return ""
     }
 
     static _WaitReady(timeoutMs) {

@@ -11,7 +11,9 @@
 #MaxThreads 20
 
 #Include "LlamaEngine.ahk"
+#Include "McpClient.ahk"
 #Include "I18n.ahk"
+#Include "License.ahk"
 
 global boundHotkeys := Map()
 
@@ -36,6 +38,10 @@ global AI_MAX_TOKENS  := 8
 global AI_CTX         := 512
 global AI_THREADS     := 0
 global AI_PORT        := 8765
+global AI_LEARNED_CONTEXT := true
+global AI_MCP_ENABLED   := false
+global AI_MCP_URL       := "http://127.0.0.1:8766"
+global AI_MODEL_PATH    := ""
 
 if !DirExist(APP_DIR)
     DirCreate(APP_DIR)
@@ -66,6 +72,30 @@ global stats := Map("predictions",0,"ai_calls",0,"session_start",A_TickCount)
 global hudGui := "", hudVisible := false, hudEnabled := true, GuiObj := ""
 
 global GRAD_TOP := 0x1E3A8A, GRAD_MID := 0x60A5FA, GRAD_BOTTOM := 0xF8FAFF
+
+
+; Sorted dropdown lists — letters, numbers, F-keys, symbols, navigation.
+OrganizedKeyList(outputOnly := false) {
+    list := []
+    Loop 26
+        list.Push(Chr(A_Index + 96))
+    Loop 10
+        list.Push(String(A_Index - 1))
+    Loop 12
+        list.Push("F" A_Index)
+    if outputOnly {
+        for s in [":","@","#","$","%","^","&","*","(",")","+","-","=","_","[","]","\","|",";","'","``",",",".","/","<",">","?","!","~",'"']
+            list.Push(s)
+        list.Push("Tab")
+        list.Push("Space")
+    } else {
+        for s in ["-","=","[","]","\",";","'","``",",",".","/"]
+            list.Push(s)
+        for k in ["Space","Enter","Tab","Esc","Backspace","Delete","Insert","Home","End","PgUp","PgDn","Up","Down","Left","Right"]
+            list.Push(k)
+    }
+    return list
+}
 
 
 ; =============================================================================
@@ -167,11 +197,13 @@ UpdateListView() {
 ;  AI FUNCTIONS (llama.dll via LlamaEngine)
 ; =============================================================================
 InitAI() {
-    global AI_MODEL, AI_ENABLED, AI_CTX, AI_THREADS, AI_PORT
+    global AI_MODEL, AI_ENABLED, AI_CTX, AI_THREADS, AI_PORT, AI_MODEL_PATH
     if !AI_ENABLED
         return false
 
-    if (AI_MODEL = "")
+    if (AI_MODEL_PATH != "" && FileExist(AI_MODEL_PATH))
+        AI_MODEL := AI_MODEL_PATH
+    else if (AI_MODEL = "")
         AI_MODEL := LlamaEngine.ResolveModelPath()
 
     LlamaEngine.port := AI_PORT
@@ -179,8 +211,120 @@ InitAI() {
     if !ok
         LogMsg("AI init failed: " LlamaEngine.LoadError)
     else
-        LogMsg("AI ready: " LlamaEngine.StatusText() " (warmup done)")
+        LogMsg("AI ready: " LlamaEngine.StatusText() " model=" AI_MODEL)
     return ok
+}
+
+RestartAI(*) {
+    global AI_ENABLED
+    if !AI_ENABLED
+        return
+    LlamaEngine.Shutdown()
+    if InitAI()
+        MsgBox "AI restarted successfully.", "AI", "Iconi T2"
+    else
+        MsgBox "AI restart failed: " LlamaEngine.LoadError, "AI", "IconX"
+    UpdateAIStatus()
+}
+
+FormatLearnedRowsForPrompt(rows, maxLines := 20) {
+    n := rows.Length
+    Loop n - 1 {
+        i := A_Index
+        Loop n - i {
+            j := A_Index
+            if (rows[j].freq < rows[j + 1].freq) {
+                tmp := rows[j]
+                rows[j] := rows[j + 1]
+                rows[j + 1] := tmp
+            }
+        }
+    }
+    out := ""
+    Loop Min(maxLines, rows.Length) {
+        out .= rows[A_Index].word "(" rows[A_Index].freq ") "
+    }
+    return Trim(out)
+}
+
+ParseLearnedRowsFromText(text, prefix := "") {
+    rows := []
+    for , line in StrSplit(text, "`n", "`r") {
+        line := Trim(line)
+        if (line = "" || RegExMatch(line, "^[;#]"))
+            continue
+        parts := StrSplit(line, A_Tab)
+        if parts.Length < 2
+            parts := StrSplit(line, ",")
+        if parts.Length < 1
+            continue
+        word := StrLower(Trim(parts[1]))
+        freq := (parts.Length >= 2 && IsInteger(parts[2])) ? Integer(parts[2]) : 1
+        if (word = "" || !RegExMatch(word, "^[a-z0-9_'@.-]+$"))
+            continue
+        if (prefix != "" && SubStr(word, 1, StrLen(prefix)) != prefix && !InStr(word, prefix))
+            continue
+        rows.Push({ word: word, freq: freq })
+    }
+    return rows
+}
+
+ReadLearnedContextForPrompt(prefix := "", maxLines := 20) {
+    global LEARN_PATH, AI_LEARNED_CONTEXT, userLearned
+    if !AI_LEARNED_CONTEXT
+        return ""
+
+    ReloadLearnedWordsSnapshot()
+
+    rows := []
+    for word, freq in userLearned {
+        if (prefix != "" && SubStr(word, 1, StrLen(prefix)) != prefix && !InStr(word, prefix))
+            continue
+        rows.Push({ word: word, freq: freq })
+    }
+    return FormatLearnedRowsForPrompt(rows, maxLines)
+}
+
+FetchLearnedViaMcp(prefix := "", maxLines := 20) {
+    global AI_MCP_ENABLED, AI_MCP_URL, LEARN_PATH
+    if !AI_MCP_ENABLED
+        return { hint: "", ok: false, source: "" }
+
+    McpClient.SetBaseUrl(AI_MCP_URL)
+    raw := McpClient.ReadTextFile("learned_words.txt")
+    if (raw = "") {
+        LogMsg("MCP read failed: " McpClient.lastError)
+        return { hint: "", ok: false, source: "mcp" }
+    }
+
+    rows := ParseLearnedRowsFromText(raw, prefix)
+    hint := FormatLearnedRowsForPrompt(rows, maxLines)
+    if (hint = "")
+        hint := "(learned_words.txt is empty or has no matching entries)"
+    return { hint: hint, ok: true, source: "mcp" }
+}
+
+ReloadLearnedWordsSnapshot() {
+    global userLearned, LEARN_PATH
+    if !FileExist(LEARN_PATH)
+        return
+    try text := FileRead(LEARN_PATH, "UTF-8")
+    catch
+        return
+    for , line in StrSplit(text, "`n", "`r") {
+        line := Trim(line)
+        if (line = "" || RegExMatch(line, "^[;#]"))
+            continue
+        parts := StrSplit(line, A_Tab)
+        if parts.Length < 2
+            parts := StrSplit(line, ",")
+        if parts.Length < 1
+            continue
+        word := StrLower(Trim(parts[1]))
+        freq := (parts.Length >= 2 && IsInteger(parts[2])) ? Integer(parts[2]) : 1
+        if (word != "" && RegExMatch(word, "^[a-z0-9_'@.-]+$"))
+            userLearned[word] := freq
+    }
 }
 
 UpdateAIStatus() {
@@ -201,19 +345,38 @@ UpdateAIStatus() {
     }
 }
 
-BuildAIPrompt(ctx, allowedLetters, rejectedChar := "") {
+BuildAIPrompt(ctx, allowedLetters, rejectedChar := "", learnedHint := "", learnedSource := "") {
+    global AI_MCP_ENABLED, AI_LEARNED_CONTEXT, LEARN_PATH
     recent := ctx.recentText
     if (StrLen(recent) > 300)
         recent := SubStr(recent, -300)
     opts := ArrayJoin(allowedLetters, ", ")
-    prompt := "You complete English words one letter at a time.`n"
+    prompt := "You complete text one letter at a time (English words, emails, URLs, names).`n"
         . "Session: " recent "`n"
+    if (ctx.compound)
+        prompt .= "Context: email/URL/compound text — ignore normal dictionary.`n"
     if (ctx.prevWord != "")
-        prompt .= "Previous word: " ctx.prevWord "`n"
+        prompt .= "Previous segment: " ctx.prevWord "`n"
     if (ctx.prefix != "")
-        prompt .= "Partial word: " ctx.prefix "`n"
+        prompt .= "Partial segment: " ctx.prefix "`n"
     else if (ctx.prevWord != "")
-        prompt .= "New word after: " ctx.prevWord "`n"
+        prompt .= "New segment after: " ctx.prevWord "`n"
+
+    if AI_MCP_ENABLED {
+        prompt .= "Personal vocabulary: use MCP read_file tool on learned_words.txt (latest file in app folder).`n"
+        if (learnedHint != "" && learnedSource = "mcp")
+            prompt .= "MCP read_file(learned_words.txt): " learnedHint "`n"
+        else if (learnedHint != "" && learnedSource = "fallback")
+            prompt .= "MCP unavailable — injected from disk instead: " learnedHint "`n"
+        else
+            prompt .= "Call read_file(path=`"learned_words.txt`") via MCP before answering if vocabulary is needed.`n"
+    } else if AI_LEARNED_CONTEXT {
+        if (learnedHint = "")
+            learnedHint := ReadLearnedContextForPrompt(ctx.prefix, 20)
+        if (learnedHint != "")
+            prompt .= "User learned words (personal): " learnedHint "`n"
+    }
+
     prompt .= "Choose exactly ONE letter from: " opts "`n"
     if (rejectedChar != "")
         prompt .= "Do NOT pick '" rejectedChar "' (user rejected it).`n"
@@ -275,16 +438,49 @@ PickBestDictLetter(prefix, allowedLetters, excludeChar := "") {
     return bestScore >= 0 ? best : ""
 }
 
-CallAI(prompt) {
-    global stats, AI_ENABLED, AI_MAX_TOKENS
+McpReadFileForTools(relativePath) {
+    global AI_MCP_URL
+    McpClient.SetBaseUrl(AI_MCP_URL)
+    return McpClient.ReadTextFile(relativePath)
+}
+
+ResolveLearnedHintForAI(ctx) {
+    global AI_MCP_ENABLED, AI_LEARNED_CONTEXT
+    if AI_MCP_ENABLED {
+        mcp := FetchLearnedViaMcp(ctx.prefix, 20)
+        if mcp.ok
+            return { hint: mcp.hint, source: "mcp" }
+        if AI_LEARNED_CONTEXT {
+            fallback := ReadLearnedContextForPrompt(ctx.prefix, 20)
+            if (fallback != "")
+                LogMsg("MCP failed (" McpClient.lastError ") — using direct learned_words injection")
+            return { hint: fallback, source: fallback != "" ? "fallback" : "" }
+        }
+        LogMsg("MCP failed (" McpClient.lastError ") — no fallback (injection disabled)")
+        return { hint: "", source: "" }
+    }
+    if AI_LEARNED_CONTEXT
+        return { hint: ReadLearnedContextForPrompt(ctx.prefix, 20), source: "inject" }
+    return { hint: "", source: "" }
+}
+
+CallAI(prompt, useMcpTools := false) {
+    global stats, AI_ENABLED, AI_MAX_TOKENS, AI_MCP_ENABLED
     if (!AI_ENABLED || !LlamaEngine.Loaded)
         return ""
 
-    result := LlamaEngine.Complete(prompt, AI_MAX_TOKENS)
+    LlamaEngine.mcpToolsEnabled := useMcpTools && AI_MCP_ENABLED
+    if LlamaEngine.mcpToolsEnabled {
+        result := LlamaEngine.CompleteWithMcpTools(prompt, McpReadFileForTools, AI_MAX_TOKENS)
+    } else {
+        result := LlamaEngine.Complete(prompt, AI_MAX_TOKENS)
+    }
+
     snippet := StrReplace(SubStr(result, 1, 40), "`n", " ")
     if (result != "") {
         stats["ai_calls"] += 1
-        LogMsg("AI ok: [" snippet "]")
+        mode := LlamaEngine.mcpToolsEnabled ? "mcp" : "plain"
+        LogMsg("AI ok (" mode "): [" snippet "]")
     } else
         LogMsg("AI empty/timeout for: " SubStr(prompt, 1, 80))
     return result
@@ -293,11 +489,51 @@ CallAI(prompt) {
 GetTypingContext() {
     global charBuffer
     return {
-        prefix: GetCurrentPrefix(),
-        prevWord: GetPreviousWord(),
+        prefix: GetSegmentPrefix(),
+        prevWord: GetPreviousSegment(),
         recentText: RTrim(charBuffer),
-        recentWords: GetRecentWords(8)
+        recentWords: GetRecentWords(8),
+        compound: IsCompoundContext()
     }
+}
+
+GetSegmentPrefix() {
+    global charBuffer
+    buf := RTrim(charBuffer)
+    i := StrLen(buf)
+    while i > 0 {
+        ch := SubStr(buf, i, 1)
+        if !RegExMatch(ch, "[a-zA-Z0-9_-]")
+            break
+        i--
+    }
+    return StrLower(SubStr(buf, i + 1))
+}
+
+GetCurrentPrefix() {
+    return GetSegmentPrefix()
+}
+
+IsCompoundContext() {
+    global charBuffer
+    tail := SubStr(charBuffer, -100)
+    return (InStr(tail, "@") || InStr(tail, ".") || RegExMatch(tail, "\d[a-zA-Z]"))
+}
+
+GetPreviousSegment() {
+    global charBuffer
+    buf := StrLower(RTrim(charBuffer))
+    prefix := GetSegmentPrefix()
+    temp := SubStr(buf, 1, StrLen(buf) - StrLen(prefix))
+    temp := RTrim(temp, "@./_- ")
+    i := StrLen(temp)
+    while i > 0 {
+        ch := SubStr(temp, i, 1)
+        if !RegExMatch(ch, "[a-zA-Z0-9_-]")
+            break
+        i--
+    }
+    return SubStr(temp, i + 1)
 }
 
 GetRecentWords(n := 5) {
@@ -334,20 +570,34 @@ GetLettersAfterPreviousWord(prevWord, allowedLetters) {
     return scores
 }
 
-GetLearnedLetterScores(prefix, allowedLetters) {
+GetLearnedLetterScores(prefix, allowedLetters, compound := false) {
     global userLearned, wordTrie
     scores := Map()
+
+    dictBest := "", dictBestScore := -999.0
+    for , letter in allowedLetters {
+        ds := compound ? 0.0 : GetDictionaryLetterScore(prefix, letter)
+        if (ds > dictBestScore) {
+            dictBestScore := ds
+            dictBest := letter
+        }
+    }
+
     for word, freq in userLearned {
-        if !wordTrie.IsCompleteWord(word)
-            continue
         if (prefix != "" && SubStr(word, 1, StrLen(prefix)) != prefix)
             continue
+        if (!compound && !wordTrie.IsCompleteWord(word) && !RegExMatch(word, "^[a-z0-9_'@.-]+$"))
+            continue
         ch := SubStr(word, StrLen(prefix) + 1, 1)
-        if (ch = "" || !RegExMatch(ch, "[a-z]"))
+        if (ch = "" || !RegExMatch(ch, "[a-z0-9]"))
             continue
         for , letter in allowedLetters {
-            if (StrLower(ch) = StrLower(letter))
-                scores[letter] := scores.Get(letter, 0) + (freq * 3.0)
+            if (StrLower(ch) = StrLower(letter)) {
+                boost := freq * 3.0
+                if (!compound && dictBest != "" && dictBest != ch && dictBestScore > 0.5)
+                    boost *= 0.3
+                scores[letter] := scores.Get(letter, 0) + boost
+            }
         }
     }
     return scores
@@ -431,6 +681,9 @@ ShouldInvokeAI(ctx, allowedLetters, scores, bestScore, skipAI, host := "") {
     if (topLetter != "" && GetDictionaryLetterScore(ctx.prefix, topLetter) < 0)
         return { use: true, rejected: "" }
 
+    if (ctx.compound)
+        return { use: true, rejected: "" }
+
     if (StrLen(ctx.prefix) >= 3 && bestScore < AI_SCORE_THRESHOLD * 1.5)
         return { use: true, rejected: "" }
 
@@ -438,7 +691,10 @@ ShouldInvokeAI(ctx, allowedLetters, scores, bestScore, skipAI, host := "") {
 }
 
 ApplyAISuggestion(scores, &source, ctx, allowedLetters, rejectedChar := "") {
-    aiText := CallAI(BuildAIPrompt(ctx, allowedLetters, rejectedChar))
+    global AI_MCP_ENABLED
+    learned := ResolveLearnedHintForAI(ctx)
+    prompt := BuildAIPrompt(ctx, allowedLetters, rejectedChar, learned.hint, learned.source)
+    aiText := CallAI(prompt, AI_MCP_ENABLED)
     aiLetter := ExtractLetterFromAI(aiText, ctx.prefix, allowedLetters, rejectedChar)
 
     if (aiLetter = "" && rejectedChar != "")
@@ -475,7 +731,7 @@ PredictNextLetters(ctx, allowedLetters, skipAI := false, host := "") {
     scores := Map()
     source := "fallback"
 
-    for letter, s in GetLearnedLetterScores(prefix, allowedLetters)
+    for letter, s in GetLearnedLetterScores(prefix, allowedLetters, ctx.compound)
         scores[letter] := scores.Get(letter, 0) + s
     if scores.Count > 0
         source := "learned"
@@ -547,12 +803,14 @@ RankCandidates(ctx, outs, skipAI := false, host := "") {
     prefix := ctx.prefix
     prev := ctx.prevWord
     pred := PredictNextLetters(ctx, outs, skipAI, host)
+    dictMul := ctx.compound ? 0.4 : 3.0
     ranked := []
     for , letter in outs {
         score := pred.scores.Get(letter, 0)
-        score += ScoreCandidate(prefix, letter, prev)
+        if !ctx.compound
+            score += ScoreCandidate(prefix, letter, prev)
         score += GetDoubleLetterBoost(prefix, letter)
-        score += GetDictionaryLetterScore(prefix, letter) * 3.0
+        score += GetDictionaryLetterScore(prefix, letter) * dictMul
         ranked.Push({ ch: letter, score: score, dict: GetDictionaryLetterScore(prefix, letter) })
     }
     n := ranked.Length
@@ -630,11 +888,13 @@ Main()
 Main() {
     global wordTrie, totalUniFreq, DICT_PATH, BIGRAM_PATH, AI_ENABLED
 
+    CheckLicense()
+
     DICT_PATH   := ResolveBundledDataPath("english_words.txt")
     BIGRAM_PATH := ResolveBundledDataPath("english_bigrams.txt")
 
     if !FileExist(INI_PATH) {
-        FileAppend("; Broken Key Remapper Pro configuration`n[Settings]`nHudEnabled=1`nAIEnabled=1`n`n[Remaps]`n", INI_PATH, "UTF-8")
+        FileAppend("; Broken Key Remapper Pro configuration`n[Settings]`nHudEnabled=1`nAIEnabled=1`nAILearnedContext=1`nAIMcpEnabled=0`nAIMcpUrl=http://127.0.0.1:8766`n`n[Remaps]`n", INI_PATH, "UTF-8")
     }
     if !FileExist(LEARN_PATH)
         FileAppend("; word`tcount`n", LEARN_PATH, "UTF-8")
@@ -667,7 +927,7 @@ Main() {
     UpdateListView()
     UpdateModeDisplay()
     ApplyLanguage()
-    GuiObj.Show("w580 h520 Center")
+    GuiObj.Show("w600 h560 Center")
 }
 
 
@@ -863,7 +1123,7 @@ LoadLearnedWords() {
             continue
         word := StrLower(Trim(parts[1]))
         freq := (parts.Length >= 2 && IsInteger(parts[2])) ? Integer(parts[2]) : 1
-        if (word != "" && RegExMatch(word, "^[a-z']+$")) {
+        if (word != "" && RegExMatch(word, "^[a-z0-9_'@.-]+$")) {
             boost := Max(freq, 1) * 50
             wordTrie.Insert(word, boost)
             userLearned[word] := userLearned.Get(word, 0) + freq
@@ -875,7 +1135,7 @@ LoadLearnedWords() {
 
 SaveLearnedWord(word, freq := 1) {
     word := StrLower(Trim(word))
-    if (word = "" || StrLen(word) < 2 || !RegExMatch(word, "^[a-z']+$"))
+    if (word = "" || StrLen(word) < 2 || !RegExMatch(word, "^[a-z0-9_'@.-]+$"))
         return
     try FileAppend(word . A_Tab . freq . "`n", LEARN_PATH, "UTF-8")
 }
@@ -885,20 +1145,31 @@ SaveLearnedWord(word, freq := 1) {
 ;  SETTINGS / STATS
 ; =============================================================================
 LoadSettings() {
-    global hudEnabled, AI_ENABLED, AI_CTX, AI_THREADS, uiLang, AI_PORT
+    global hudEnabled, AI_ENABLED, AI_CTX, AI_THREADS, uiLang, AI_PORT, AI_MODEL_PATH
+    global AI_LEARNED_CONTEXT, AI_MCP_ENABLED, AI_MCP_URL
     try hudEnabled := IniRead(INI_PATH, "Settings", "HudEnabled", "1") = "1"
     try AI_ENABLED := IniRead(INI_PATH, "Settings", "AIEnabled", "1") = "1"
+    try AI_LEARNED_CONTEXT := IniRead(INI_PATH, "Settings", "AILearnedContext", "1") = "1"
+    try AI_MCP_ENABLED := IniRead(INI_PATH, "Settings", "AIMcpEnabled", "0") = "1"
+    try AI_MCP_URL := IniRead(INI_PATH, "Settings", "AIMcpUrl", "http://127.0.0.1:8766")
     try AI_CTX := Integer(IniRead(INI_PATH, "Settings", "AIContext", "512"))
     try AI_THREADS := Integer(IniRead(INI_PATH, "Settings", "AIThreads", "0"))
     try AI_PORT := Integer(IniRead(INI_PATH, "Settings", "AIPort", "8765"))
+    try AI_MODEL_PATH := IniRead(INI_PATH, "Settings", "AIModelPath", "")
     try uiLang := IniRead(INI_PATH, "Settings", "UILanguage", "en")
+    McpClient.SetBaseUrl(AI_MCP_URL)
 }
 
 SaveSettings() {
-    global hudEnabled, AI_ENABLED, uiLang
+    global hudEnabled, AI_ENABLED, uiLang, AI_MODEL_PATH, AI_LEARNED_CONTEXT, AI_MCP_ENABLED, AI_MCP_URL
     IniWrite(hudEnabled ? "1" : "0", INI_PATH, "Settings", "HudEnabled")
     IniWrite(AI_ENABLED ? "1" : "0", INI_PATH, "Settings", "AIEnabled")
+    IniWrite(AI_LEARNED_CONTEXT ? "1" : "0", INI_PATH, "Settings", "AILearnedContext")
+    IniWrite(AI_MCP_ENABLED ? "1" : "0", INI_PATH, "Settings", "AIMcpEnabled")
+    IniWrite(AI_MCP_URL, INI_PATH, "Settings", "AIMcpUrl")
+    IniWrite(AI_MODEL_PATH, INI_PATH, "Settings", "AIModelPath")
     IniWrite(uiLang, INI_PATH, "Settings", "UILanguage")
+    McpClient.SetBaseUrl(AI_MCP_URL)
 }
 
 LoadStats() {
@@ -976,20 +1247,20 @@ BuildMainGui() {
     global GuiObj, hudEnabled, uiLang
     GuiObj := Gui("+Resize", T("app_title"))
     GuiObj.MarginX := 20
-    GuiObj.MarginY := 18
-    GuiObj.SetFont("s11 cWhite", "Segoe UI")
-    GuiObj.BackColor := 0x1E3A8A
+    GuiObj.MarginY := 16
+    GuiObj.SetFont("s10 cWhite", "Segoe UI")
+    GuiObj.BackColor := 0x0F172A
 
     OnMessage(0x14, PaintGradient)
     GuiObj.OnEvent("Size", (*) => DllCall("InvalidateRect", "Ptr", GuiObj.Hwnd, "Ptr", 0, "Int", 1))
 
-    GuiObj.SetFont("s16 Bold cWhite", "Segoe UI")
-    GuiObj.AddText("x20 y16 w400 h28 BackgroundTrans vTxtTitle", "  " T("app_title"))
-    GuiObj.SetFont("s9 cD0E4FF", "Segoe UI")
-    GuiObj.AddText("x20 y46 w400 h18 BackgroundTrans vTxtSubtitle", "  " T("subtitle"))
+    GuiObj.SetFont("s18 Bold cWhite", "Segoe UI Semibold")
+    GuiObj.AddText("x24 y18 w420 h32 BackgroundTrans vTxtTitle", T("app_title"))
+    GuiObj.SetFont("s9 cBFE8FF", "Segoe UI")
+    GuiObj.AddText("x24 y50 w420 h18 BackgroundTrans vTxtSubtitle", T("subtitle"))
 
-    GuiObj.SetFont("s9 cWhite", "Segoe UI")
-    GuiObj.AddText("x340 y18 w80 h20 Right BackgroundTrans vTxtLangLbl", T("lang_lbl"))
+    GuiObj.SetFont("s9 cE0F2FE", "Segoe UI")
+    GuiObj.AddText("x400 y22 w80 h20 Right BackgroundTrans vTxtLangLbl", T("lang_lbl"))
     langLabels := []
     chooseIdx := 1
     for i, opt in LangOptions() {
@@ -997,49 +1268,50 @@ BuildMainGui() {
         if (opt.code = uiLang)
             chooseIdx := i
     }
-    langDd := GuiObj.AddDropDownList("x420 y14 w140 vLangSelect Choose" chooseIdx, langLabels)
+    langDd := GuiObj.AddDropDownList("x484 y18 w120 vLangSelect Choose" chooseIdx, langLabels)
     langDd.OnEvent("Change", OnLanguageChanged)
 
-    GuiObj.SetFont("s10 Norm cWhite", "Segoe UI")
-    GuiObj.AddText("x20 y72 w540 h20 BackgroundTrans vTxtMappingHdr", T("mapping_hdr"))
+    GuiObj.AddText("x24 y78 w552 h22 BackgroundTrans vTxtMappingHdr cF0F9FF", "  " T("mapping_hdr"))
 
-    lv := GuiObj.AddListView("x20 y94 w540 h200 vLVRemapList -Multi Background0xFFFFFF c333333"
+    lv := GuiObj.AddListView("x24 y102 w552 h210 vLVRemapList -Multi Background0xFFFFFF c1E293B"
         , [T("col_pressable"), T("col_outputs"), T("col_current"), T("col_vk"), T("col_sc"), T("col_uses")])
     lv.Opt("+Grid")
 
-    GuiObj.SetFont("s9 cBlack", "Segoe UI")
-    btnY := 306
-    btn := GuiObj.AddButton("x20 y" btnY " w120 h36 vBtnAdd", T("btn_add"))
+    GuiObj.SetFont("s9 c0F172A", "Segoe UI")
+    btnY := 324
+    btn := GuiObj.AddButton("x24 y" btnY " w118 h34 vBtnAdd", T("btn_add"))
     btn.OnEvent("Click", AddOrEditMapping)
-    btn := GuiObj.AddButton("x148 y" btnY " w110 h36 vBtnRemove", T("btn_remove"))
+    btn := GuiObj.AddButton("x148 y" btnY " w108 h34 vBtnRemove", T("btn_remove"))
     btn.OnEvent("Click", RemoveSelected)
-    btn := GuiObj.AddButton("x266 y" btnY " w110 h36 vBtnClear", T("btn_clear"))
+    btn := GuiObj.AddButton("x262 y" btnY " w108 h34 vBtnClear", T("btn_clear"))
     btn.OnEvent("Click", ClearAll)
-    btn := GuiObj.AddButton("x384 y" btnY " w85 h36 vBtnExport", T("btn_export"))
+    btn := GuiObj.AddButton("x376 y" btnY " w92 h34 vBtnExport", T("btn_export"))
     btn.OnEvent("Click", ExportConfig)
-    btn := GuiObj.AddButton("x477 y" btnY " w83 h36 vBtnImport", T("btn_import"))
+    btn := GuiObj.AddButton("x474 y" btnY " w102 h34 vBtnImport", T("btn_import"))
     btn.OnEvent("Click", ImportConfig)
 
-    GuiObj.SetFont("s10 cWhite", "Segoe UI")
-    GuiObj.AddText("x20 y358 w120 h28 BackgroundTrans vTxtModeLbl", T("mode_lbl"))
-    GuiObj.SetFont("s11 Bold cWhite", "Segoe UI")
-    GuiObj.AddText("x144 y356 w260 h30 vModeText Background0xC81E1E Center 0x200", T("mode_normal"))
+    GuiObj.SetFont("s10 cF0F9FF", "Segoe UI")
+    GuiObj.AddText("x24 y372 w120 h26 BackgroundTrans vTxtModeLbl", T("mode_lbl"))
+    GuiObj.SetFont("s11 Bold cWhite", "Segoe UI Semibold")
+    GuiObj.AddText("x148 y370 w280 h32 vModeText Background0xDC2626 Center 0x200", T("mode_normal"))
 
-    chk := GuiObj.AddCheckbox("x20 y386 w420 h22 cWhite vChkHud Checked" (hudEnabled ? "1" : "0"), T("chk_hud"))
+    GuiObj.SetFont("s9 cE0F2FE", "Segoe UI")
+    chk := GuiObj.AddCheckbox("x24 y408 w440 h22 cWhite vChkHud Checked" (hudEnabled ? "1" : "0"), T("chk_hud"))
     chk.OnEvent("Click", ToggleHudEnabled)
 
-    GuiObj.SetFont("s9 cBlack", "Segoe UI")
-    btn := GuiObj.AddButton("x20 y416 w200 h42 vToggleBtn Default", T("btn_toggle"))
+    GuiObj.SetFont("s10 c0F172A", "Segoe UI Semibold")
+    btn := GuiObj.AddButton("x24 y438 w175 h40 vToggleBtn Default", T("btn_toggle"))
     btn.OnEvent("Click", ToggleMode)
-    btn := GuiObj.AddButton("x230 y416 w165 h42 vBtnWizard", T("btn_wizard"))
+    btn := GuiObj.AddButton("x206 y438 w130 h40 vBtnWizard", T("btn_wizard"))
     btn.OnEvent("Click", RunWizard)
-    btn := GuiObj.AddButton("x405 y416 w155 h42 vBtnStats", T("btn_stats"))
+    btn := GuiObj.AddButton("x342 y438 w100 h40 vBtnStats", T("btn_stats"))
     btn.OnEvent("Click", ShowStats)
+    btn := GuiObj.AddButton("x448 y438 w128 h40 vBtnSettings", "Settings")
+    btn.OnEvent("Click", ShowSettings)
 
-    GuiObj.SetFont("s8 c1E3A8A", "Segoe UI")
-    GuiObj.AddText("x20 y448 w540 h18 BackgroundTrans vAIText c90EE90", "  AI: …")
-
-    GuiObj.AddText("x20 y468 w540 h40 BackgroundTrans vTxtHotkeys", T("hotkeys"))
+    GuiObj.SetFont("s8 c7DD3FC", "Segoe UI")
+    GuiObj.AddText("x24 y486 w552 h16 BackgroundTrans vAIText c90EE90", "  AI: …")
+    GuiObj.AddText("x24 y504 w552 h36 BackgroundTrans vTxtHotkeys c94A3B8", T("hotkeys"))
 
     GuiObj.OnEvent("Close",  (*) => OnExitApp())
     GuiObj.OnEvent("Escape", (*) => GuiObj.Minimize())
@@ -1103,6 +1375,7 @@ BuildTrayMenu() {
     tray.Add()
     tray.Add(T("tray_stats"), (*) => ShowStats())
     tray.Add(T("tray_wizard"), (*) => RunWizard())
+    tray.Add("License...", ShowLicenseInfo)
     tray.Add()
     tray.Add(T("tray_exit"), (*) => OnExitApp())
     tray.Default := T("tray_show")
@@ -1125,44 +1398,27 @@ CommitChar(ch) {
         charBuffer := SubStr(charBuffer, -maxBuffer)
 }
 
-GetCurrentPrefix() {
-    global charBuffer
-    i := StrLen(charBuffer)
-    while i > 0 {
-        ch := SubStr(charBuffer, i, 1)
-        if !RegExMatch(ch, "[a-z']")
-            break
-        i--
-    }
-    return SubStr(charBuffer, i + 1)
-}
-
 GetPreviousWord() {
-    global charBuffer
-    buf := StrLower(charBuffer)
-    prefix := GetCurrentPrefix()
-    temp := RTrim(SubStr(buf, 1, StrLen(buf) - StrLen(prefix)))
-    i := StrLen(temp)
-    while (i > 0) {
-        ch := SubStr(temp, i, 1)
-        if RegExMatch(ch, "[a-z]") {
-            startEnd := i
-            while (i > 0 && RegExMatch(SubStr(temp, i, 1), "[a-z']"))
-                i--
-            return SubStr(temp, i + 1, startEnd - i)
-        }
-        i--
-    }
-    return ""
+    return GetPreviousSegment()
 }
 
 LearnIfWordCompleted() {
     global wordTrie, learnedPending, userLearned
-    word := GetCurrentPrefix()
-    if (word = "" || StrLen(word) < 2 || !RegExMatch(word, "^[a-z']+$") || StrLen(word) > 30)
+    word := GetSegmentPrefix()
+    if (word = "" || StrLen(word) < 2 || StrLen(word) > 40)
         return
-    if !wordTrie.IsCompleteWord(word)
+    if IsCompoundContext() {
+        SaveLearnedToken(word)
         return
+    }
+    if !RegExMatch(word, "^[a-z']+$") || !wordTrie.IsCompleteWord(word)
+        return
+    SaveLearnedToken(word)
+}
+
+SaveLearnedToken(word) {
+    global wordTrie, learnedPending, userLearned
+    word := StrLower(word)
     wordTrie.Insert(word, 50)
     learnedPending[word] := learnedPending.Get(word, 0) + 1
     userLearned[word] := userLearned.Get(word, 0) + 1
@@ -1265,6 +1521,9 @@ TruncateLearnedIfHuge() {
 ~\::SafeBufferChar("\")
 ~'::SafeBufferChar("'")
 
+~@::SafeCompoundBoundary("@")
+~+;::SafeCompoundBoundary(":")
+
 ~Space::SafeWordBoundary(" ")
 ~Enter::SafeWordBoundary(" ")
 
@@ -1304,6 +1563,15 @@ SafeWordBoundary(ch) {
     charBuffer .= ch
 }
 
+SafeCompoundBoundary(ch) {
+    global charBuffer, sendingInternally
+    if sendingInternally
+        return
+    CommitTraversal()
+    LearnIfWordCompleted()
+    charBuffer .= ch
+}
+
 
 ; =============================================================================
 ;  CORE LOGIC
@@ -1320,7 +1588,7 @@ UpdateModeDisplay() {
     badge := GuiObj["ModeText"]
     if remapMode {
         badge.Text := T("mode_mapped")
-        badge.Opt("+Background0x16A34A")
+        badge.Opt("+Background0x059669")
     } else {
         badge.Text := T("mode_normal")
         badge.Opt("+Background0xC81E1E")
@@ -1416,7 +1684,7 @@ SendPredictedOrLocked(host, *) {
             srcTag := "fallback"
         } else {
             best := ranked[1].ch
-            if (GetDictionaryLetterScore(ctx.prefix, best) < 0) {
+            if (!ctx.compound && GetDictionaryLetterScore(ctx.prefix, best) < 0) {
                 validBest := PickBestValidCandidate(ranked, ctx.prefix)
                 if (validBest != "" && validBest != best) {
                     best := validBest
@@ -1612,18 +1880,19 @@ AddOrEditMapping(*) {
 
     if (msg = "Yes") {
         val := SelectOutputFromDropdown("2. Select OUTPUT character(s)")
+        if (val = "")
+            return
     } else {
         ib := InputBox('Output for "' host '" (comma separated for multiple)',
                        "Output", "w400")
         if (ib.Result != "OK")
             return
         val := Trim(ib.Value)
+        if (val = "")
+            return
     }
 
-    if (val = "")
-        remaps.Delete(host)
-    else
-        remaps[host] := val
+    remaps[host] := val
 
     SaveRemapsToIni()
     BuildGroupsFromRemaps()
@@ -1716,6 +1985,88 @@ ShowStats(*) {
     MsgBox msg, T("btn_stats"), "Iconi"
 }
 
+ShowSettings(*) {
+    global AI_ENABLED, AI_LEARNED_CONTEXT, AI_MODEL_PATH, AI_MCP_ENABLED, AI_MCP_URL
+
+    BrowseModel(*) {
+        f := FileSelect(3, A_ScriptDir, "Select GGUF model", "Model (*.gguf)")
+        if f != ""
+            sg["EdModel"].Text := f
+    }
+    SettingsRestartAI(*) {
+        global AI_MODEL_PATH
+        AI_MODEL_PATH := sg["EdModel"].Text
+        SaveSettings()
+        LlamaEngine.Shutdown()
+        InitAI()
+        UpdateAIStatus()
+        MsgBox "AI restarted.", "Settings", "Iconi T2"
+    }
+    SetupMcpServer(*) {
+        if McpClient.StartServer() {
+            MsgBox "MCP server window opened.`n`nKeep it running while MCP mode is enabled.`n`nURL: " sg["EdMcpUrl"].Text,
+                "MCP Server", "Iconi T3"
+        }
+    }
+    TestMcpConnection(*) {
+        McpClient.SetBaseUrl(sg["EdMcpUrl"].Text)
+        if McpClient.Ping() {
+            MsgBox "MCP bridge is online.`n`n" McpClient.StatusText(), "MCP", "Iconi"
+        } else {
+            MsgBox "MCP bridge is not reachable.`n`n" McpClient.lastError
+                . "`n`nClick Setup MCP first, or check the URL.", "MCP", "Icon!"
+        }
+    }
+    SaveSettingsDlg(*) {
+        global AI_ENABLED, AI_LEARNED_CONTEXT, AI_MODEL_PATH, AI_MCP_ENABLED, AI_MCP_URL
+        AI_ENABLED := sg["ChkAI"].Value
+        AI_LEARNED_CONTEXT := sg["ChkLearned"].Value
+        AI_MCP_ENABLED := sg["ChkMcp"].Value
+        AI_MCP_URL := Trim(sg["EdMcpUrl"].Text)
+        AI_MODEL_PATH := sg["EdModel"].Text
+        if (AI_MCP_URL = "")
+            AI_MCP_URL := "http://127.0.0.1:8766"
+        SaveSettings()
+        McpClient.SetBaseUrl(AI_MCP_URL)
+        if AI_ENABLED && !LlamaEngine.Loaded
+            InitAI()
+        UpdateAIStatus()
+        if AI_MCP_ENABLED && !McpClient.Ping() {
+            MsgBox "MCP mode saved, but the bridge is offline.`n`n"
+                . "Use Setup MCP or enable Inject learned_words as fallback.",
+                "Settings", "Icon!"
+        }
+        sg.Destroy()
+    }
+
+    sg := Gui("+AlwaysOnTop +ToolWindow", "Settings")
+    sg.SetFont("s10", "Segoe UI")
+    sg.BackColor := 0xF8FAFC
+    sg.Add("Text", "x16 y12 w420 c0F172A", "AI & personalization settings")
+    sg.Add("Checkbox", "x16 y36 w400 vChkAI Checked" (AI_ENABLED ? 1 : 0), "Enable AI (llama-server)")
+    sg.Add("Checkbox", "x16 y60 w400 vChkLearned Checked" (AI_LEARNED_CONTEXT ? 1 : 0),
+        "Inject learned_words.txt into AI prompts (simple)")
+    sg.Add("Checkbox", "x16 y84 w400 vChkMcp Checked" (AI_MCP_ENABLED ? 1 : 0),
+        "Enable MCP for learned_words.txt (advanced)")
+    sg.Add("Text", "x16 y112 w420 c475569",
+        "Simple: reads learned_words.txt from disk each AI call.`n"
+        . "MCP: uses read_file via a local MCP filesystem server (more powerful).`n"
+        . "If MCP fails, simple injection is used when both are enabled.")
+    sg.Add("Text", "x16 y168 w80", "MCP URL:")
+    sg.Add("Edit", "x16 y188 w248 vEdMcpUrl", AI_MCP_URL != "" ? AI_MCP_URL : "http://127.0.0.1:8766")
+    sg.Add("Button", "x272 y186 w72", "Test").OnEvent("Click", TestMcpConnection)
+    sg.Add("Button", "x350 y186 w74", "Setup MCP").OnEvent("Click", SetupMcpServer)
+    sg.Add("Text", "x16 y224 w80", "Model (.gguf):")
+    sg.Add("Edit", "x16 y244 w248 vEdModel ReadOnly", AI_MODEL_PATH != "" ? AI_MODEL_PATH : LlamaEngine.ResolveModelPath())
+    sg.Add("Button", "x272 y242 w72", "Browse...").OnEvent("Click", BrowseModel)
+    sg.Add("Button", "x16 y280 w100", "Restart AI").OnEvent("Click", SettingsRestartAI)
+    sg.Add("Button", "x122 y280 w100", "Setup AI").OnEvent("Click", (*) => Run(A_ComSpec ' /c start powershell -ExecutionPolicy Bypass -File "' A_ScriptDir '\Setup-AI.ps1"'))
+    sg.Add("Button", "x272 y280 w74 Default", "Save").OnEvent("Click", SaveSettingsDlg)
+    sg.Add("Button", "x350 y280 w74", "Cancel").OnEvent("Click", (*) => sg.Destroy())
+    sg.OnEvent("Close", (*) => sg.Destroy())
+    sg.Show("w440 h330")
+}
+
 GetSinglePhysicalKey(prompt) {
     MsgBox prompt, "Press a key", "OK Iconi"
     ih := InputHook("L1 T15 E V")
@@ -1745,23 +2096,16 @@ GetSinglePhysicalKey(prompt) {
 ;  `destroyed` flag so the OK/Cancel handlers cannot be re-entered.
 ; -----------------------------------------------------------------------------
 SelectKeyFromDropdown(title) {
-    static keys := [
-        "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
-        "0","1","2","3","4","5","6","7","8","9",
-        "Space","Enter","Tab","Esc","Backspace","Delete","Insert","Home","End","PgUp","PgDn",
-        "Up","Down","Left","Right",
-        "F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12",
-        "-","=","[","]","\",";","'","``",",",".","/"
-    ]
+    keys := OrganizedKeyList(false)
 
     result    := ""
     destroyed := false
 
     g := Gui("+AlwaysOnTop +ToolWindow", title)
     g.SetFont("s10", "Segoe UI")
-    g.BackColor := 0xEFF6FF
-    g.Add("Text", "x14 y14 w280 c1E3A8A", title)
-    g.Add("DropDownList", "x14 y42 w260 vSelectedKey Choose1 Sort", keys)
+    g.BackColor := 0xF0F9FF
+    g.Add("Text", "x14 y14 w300 c0F172A", title)
+    g.Add("DropDownList", "x14 y42 w280 vSelectedKey Choose1", keys)
     g.Add("Button", "x14 y88 w80 Default", "OK").OnEvent("Click", OkClicked)
     g.Add("Button", "x102 y88 w80",         "Cancel").OnEvent("Click", CancelClicked)
     g.OnEvent("Close",  CancelClicked)
@@ -1794,12 +2138,7 @@ SelectKeyFromDropdown(title) {
 }
 
 SelectOutputFromDropdown(title) {
-    static keys := [
-        "a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z",
-        "0","1","2","3","4","5","6","7","8","9",
-        "Space","Enter","Tab",
-        "-","=","[","]","\",";","'","``",",",".","/"
-    ]
+    keys := OrganizedKeyList(true)
     outputs := []
 
     Loop {
@@ -1808,10 +2147,10 @@ SelectOutputFromDropdown(title) {
 
         g := Gui("+AlwaysOnTop +ToolWindow", title)
         g.SetFont("s10", "Segoe UI")
-        g.BackColor := 0xEFF6FF
-        g.Add("Text", "x14 y14 w300 c1E3A8A",
+        g.BackColor := 0xF0F9FF
+        g.Add("Text", "x14 y14 w300 c0F172A",
               title "`n(Pick one, then optionally add more.)")
-        g.Add("DropDownList", "x14 y56 w280 vSelectedOutput Choose1 Sort", keys)
+        g.Add("DropDownList", "x14 y56 w280 vSelectedOutput Choose1", keys)
         g.Add("Button", "x14 y100 w80 Default", "OK").OnEvent("Click", OkClicked)
         g.Add("Button", "x102 y100 w80",         "Cancel").OnEvent("Click", CancelClicked)
         g.OnEvent("Close",  CancelClicked)
