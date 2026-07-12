@@ -50,15 +50,58 @@ function Resolve-UvxPath {
     return $null
 }
 
+function Find-LocalMcpBin {
+    # Prefer the locally pre-installed package (put there by Setup-MCP.ps1).
+    # This avoids any npm registry download at runtime and works fully offline.
+    $McpDir = Join-Path $RootDir "mcp-server"
+    $candidates = @(
+        (Join-Path $McpDir "node_modules\.bin\mcp-server-filesystem.cmd"),
+        (Join-Path $McpDir "node_modules\.bin\mcp-server-filesystem"),
+        (Join-Path $McpDir "node_modules\@modelcontextprotocol\server-filesystem\dist\index.js")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return $null
+}
+
 function Find-McpLauncher {
+    # 1. Prefer the locally pre-installed binary (Setup-MCP.ps1 puts it here).
+    #    This is instant, works offline, and never triggers antivirus scans.
+    $localBin = Find-LocalMcpBin
+    if ($localBin) {
+        if ($localBin -match '\.js$') {
+            # It's a plain JS file — run it with node
+            $node = Get-Command node -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+            if (-not $node) { $node = "$env:ProgramFiles\nodejs\node.exe" }
+            if ($node -and (Test-Path $node)) {
+                return @{
+                    File   = $node
+                    Args   = "`"$localBin`" `"$RootDir`""
+                    Detail = "local node $localBin"
+                }
+            }
+        } else {
+            return @{
+                File   = $localBin
+                Args   = "`"$RootDir`""
+                Detail = "local $localBin"
+            }
+        }
+    }
+
+    # 2. Fall back to global npx (downloads on first run — slow on fresh PCs).
     $npx = Resolve-NpxPath
     if ($npx) {
+        Write-Log "Local MCP install not found - falling back to npx (run Setup-MCP.ps1 to pre-install)."
         return @{
             File   = $npx
             Args   = "-y @modelcontextprotocol/server-filesystem `"$RootDir`""
             Detail = "npx @modelcontextprotocol/server-filesystem"
         }
     }
+
+    # 3. Try uvx as a last resort.
     $uvx = Resolve-UvxPath
     if ($uvx) {
         return @{
@@ -67,7 +110,8 @@ function Find-McpLauncher {
             Detail = "uvx mcp-server-filesystem"
         }
     }
-    throw "Install Node.js (npx) from https://nodejs.org/ - required for MCP mode."
+
+    throw "MCP server not found. Run Setup-MCP.ps1 to install it, or install Node.js from https://nodejs.org/"
 }
 
 function Start-McpProcess([hashtable]$Launcher) {
