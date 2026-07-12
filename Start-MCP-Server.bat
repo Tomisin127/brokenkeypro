@@ -8,8 +8,9 @@ echo  ====================================
 echo  Directory: %CD%
 echo  HTTP API:  http://127.0.0.1:8766/health
 echo.
-echo  Requires Node.js (npx) - https://nodejs.org/
-echo  First run downloads @modelcontextprotocol/server-filesystem automatically.
+echo  Requires Node.js - https://nodejs.org/
+echo  TIP: Run Setup-MCP.ps1 ONCE first to pre-install the MCP package locally.
+echo  This makes startup instant and works without internet after that.
 echo.
 echo  Keep this window open while MCP mode is enabled in Settings.
 echo  Press Ctrl+C to stop.
