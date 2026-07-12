@@ -244,12 +244,23 @@ function Invoke-McpReadTextFile([System.Diagnostics.Process]$Proc, [string]$Rela
 }
 
 function Send-HttpJson([System.Net.HttpListenerResponse]$Response, [int]$StatusCode, [string]$Json) {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
-    $Response.StatusCode = $StatusCode
-    $Response.ContentType = "application/json; charset=utf-8"
-    $Response.ContentLength64 = $bytes.Length
-    $Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Response.OutputStream.Close()
+    # Guard: if the response stream is already closed (e.g. a prior write
+    # failed mid-flight and the catch block is trying to send an error),
+    # silently discard rather than throwing "ContentLength64 cannot be set
+    # after the response has been submitted."
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $Response.StatusCode = $StatusCode
+        $Response.ContentType = "application/json; charset=utf-8"
+        $Response.ContentLength64 = $bytes.Length
+        $Response.OutputStream.Write($bytes, 0, $bytes.Length)
+        $Response.OutputStream.Close()
+    } catch [System.ObjectDisposedException] {
+        # Stream already disposed — nothing to do.
+    } catch {
+        # Any other error writing the response: try to close cleanly.
+        try { $Response.OutputStream.Close() } catch {}
+    }
 }
 
 function Escape-JsonString([string]$s) {
@@ -300,10 +311,12 @@ try {
         $path = $req.Url.AbsolutePath.TrimEnd("/")
         if (-not $path) { $path = "/" }
 
+        $responseSent = $false
         try {
             if ($path -eq "/health") {
                 $mode = if ($script:McpReady) { "mcp" } else { "direct" }
                 Send-HttpJson $res 200 ('{"ok":true,"mode":"' + $mode + '","root":"' + (Escape-JsonString $RootDir) + '"}')
+                $responseSent = $true
                 continue
             }
 
@@ -326,12 +339,26 @@ try {
                     $text = [IO.File]::ReadAllText($full, [Text.Encoding]::UTF8)
                 }
                 Send-HttpJson $res 200 ('{"ok":true,"path":"' + (Escape-JsonString $rel) + '","content":"' + (Escape-JsonString $text) + '"}')
+                $responseSent = $true
                 continue
             }
 
             Send-HttpJson $res 404 ('{"ok":false,"error":"not found"}')
+            $responseSent = $true
         } catch {
-            Send-HttpJson $res 500 ('{"ok":false,"error":"' + (Escape-JsonString $_.Exception.Message) + '"}')
+            $errMsg = Escape-JsonString $_.Exception.Message
+            Write-Log "Request error [$($req.HttpMethod) $path]: $($_.Exception.Message)"
+            # Only attempt to send an error response if nothing has been written
+            # yet. If Send-HttpJson already started writing and then failed, the
+            # response stream is in an indeterminate state and calling it again
+            # would produce the "ContentLength64 cannot be set after response
+            # has been submitted" exception.
+            if (-not $responseSent) {
+                Send-HttpJson $res 500 ('{"ok":false,"error":"' + $errMsg + '"}')
+            } else {
+                # Response was already (partially) sent — close the stream cleanly.
+                try { $res.OutputStream.Close() } catch {}
+            }
         }
     }
 } finally {
